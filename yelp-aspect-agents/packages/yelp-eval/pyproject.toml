@@ -1,0 +1,17 @@
+[project]
+name = "yelp-eval"
+version = "0.1.0"
+description = "Metrics against star ratings, business roll-ups and 3D visualization"
+requires-python = ">=3.10"
+dependencies = ["yelp-core", "yelp-scoring", "numpy>=1.26", "pandas>=2.1", "scikit-learn>=1.4", "scipy>=1.11", "plotly>=5.20"]
+
+[tool.uv.sources]
+yelp-core = { workspace = true }
+yelp-scoring = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/yelp_eval"]

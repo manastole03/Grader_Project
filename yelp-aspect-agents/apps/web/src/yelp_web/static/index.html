@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yelp Aspect Agents</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232a78d6'/%3E%3Cpath d='M9 22l7-12 7 12' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/styles.css">
+<script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js" defer></script>
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <div class="brand">
+      <svg width="26" height="26" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="var(--accent)"/><path d="M9 22l7-12 7 12" stroke="#fff" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <div><b>Yelp Aspect Agents</b><br><span>Food · Service · Ambience</span></div>
+    </div>
+    <nav class="tabs" role="tablist">
+      <button role="tab" data-tab="analyze" aria-selected="true">Analyze</button>
+      <button role="tab" data-tab="explore" aria-selected="false">Explore</button>
+      <button role="tab" data-tab="metrics" aria-selected="false">Metrics</button>
+    </nav>
+    <div class="backend">
+      <label for="provider">Model</label>
+      <select id="provider"></select>
+      <button class="icon-btn" id="theme" title="Toggle theme" aria-label="Toggle theme">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      </button>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <!-- ANALYZE -->
+  <section class="view" id="view-analyze">
+    <h2>Run the agent team on a review</h2>
+    <p class="lede">Three specialist agents each quote what the review says about one aspect, working in parallel. Python checks every quote against the text and computes the scores, and an arbiter settles quotes claimed by two aspects. A lead agent gives the overall verdict. Each review ends up as a point in 3-D aspect space.</p>
+
+    <div class="card review-box">
+      <p class="review-meta" id="review-meta">Paste a review, or load a random one from the Yelp sample.</p>
+      <textarea id="review-text" placeholder="The brisket was smoky and tender, but we waited 40 minutes and nobody checked on us. Loud, cramped dining room…"></textarea>
+      <div class="row" style="margin-top:10px">
+        <button class="btn" id="random-btn">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 3h5v5M4 20 21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></svg>
+          Random Yelp review
+        </button>
+        <label class="check"><input type="checkbox" id="few-shot" checked> Few-shot examples</label>
+        <label class="check"><input type="checkbox" id="arbiter" checked> Arbiter agent</label>
+        <span class="spacer"></span>
+        <button class="btn primary" id="run-btn">Run agents
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="pipeline" id="pipeline"></div>
+    <div id="arbiter-notes"></div>
+
+    <div class="card" id="highlight-card" style="margin-top:16px" hidden>
+      <h3 class="section">Evidence the agents cited</h3>
+      <p class="highlighted" id="highlighted"></p>
+    </div>
+  </section>
+
+  <!-- EXPLORE -->
+  <section class="view" id="view-explore" hidden>
+    <h2>Explore the aspect space</h2>
+    <p class="lede">Each point is one review, placed by its food, service and ambience scores (−1 to +1; 0 means the aspect wasn't mentioned). Select a point or a table row to read the review and the agents' reasoning.</p>
+
+    <div class="card">
+      <div class="row">
+        <b class="small">Batch run</b>
+        <span class="small muted">Analyze the first</span>
+        <input type="number" id="run-n" min="1" max="5000" value="50" aria-label="Number of reviews">
+        <span class="small muted">sample reviews with</span>
+        <input type="number" id="run-workers" min="1" max="16" value="2" aria-label="Workers">
+        <span class="small muted">workers</span>
+        <button class="btn" id="batch-btn">Start</button>
+        <div class="progress" aria-hidden="true"><i id="batch-bar"></i></div>
+        <span class="small muted" id="batch-status" aria-live="polite">Idle</span>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:16px">
+      <div class="seg" role="group" aria-label="Color points by">
+        <button data-color="actual" aria-pressed="true">Actual rating</button>
+        <button data-color="pred" aria-pressed="false">Predicted sentiment</button>
+      </div>
+      <div class="legend" id="legend">
+        <span><i class="sym negative"></i>Negative (1–2★)</span>
+        <span><i class="sym neutral"></i>Neutral (3★)</span>
+        <span><i class="sym positive"></i>Positive (4–5★)</span>
+      </div>
+      <span class="spacer"></span>
+      <input type="search" id="search" placeholder="Filter by business, city or text…" aria-label="Filter">
+    </div>
+
+    <div class="explore-grid">
+      <div class="card" style="padding:8px"><div id="scatter" role="img" aria-label="3-D scatter of reviews by food, service and ambience score"></div></div>
+      <div class="card detail" id="detail"><div class="empty small">Select a point to see the review and each agent's verdict.</div></div>
+    </div>
+
+    <div class="card table-wrap">
+      <table id="results-table">
+        <thead><tr>
+          <th>Business</th><th>Review</th><th class="num">Stars</th>
+          <th>Food</th><th>Service</th><th>Ambience</th><th>Overall</th><th class="num">Pred ★</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- METRICS -->
+  <section class="view" id="view-metrics" hidden>
+    <h2>How well do the agents agree with reviewers?</h2>
+    <p class="lede">The only ground truth is the star rating, so 1–2★ counts as negative, 3★ as neutral and 4–5★ as positive. The per-aspect correlations show how closely each dimension tracks the rating. All metrics are computed in Python with 95% confidence intervals.</p>
+    <div id="metrics-body"></div>
+  </section>
+</main>
+</body>
+</html>
