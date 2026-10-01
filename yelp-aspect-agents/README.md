@@ -13,6 +13,9 @@ aspect.
 covers setup (ASU VPN, Voyager API key), a step-by-step walkthrough, a code tour, the agents' prompts,
 the scoring and statistics, the results, and a glossary.
 
+**Colab notebook:** [`notebooks/yelp_aspect_agents_colab.ipynb`](notebooks/yelp_aspect_agents_colab.ipynb)
+([open in Colab](https://colab.research.google.com/github/manastole03/Grader_Project/blob/main/yelp-aspect-agents/notebooks/yelp_aspect_agents_colab.ipynb)) runs the whole pipeline in one notebook with the same model, prompts and formulas.
+
 ```
             ┌ food agent ─────┐   quotes +     ┌────────── Python ──────────┐
 review ───► ├ service agent ──┤ ─ polarity + ─►│ ground quotes in the text  │─► arbiter agent ─► lead agent ─► Python: overall score,
@@ -35,17 +38,84 @@ review ───► ├ service agent ──┤ ─ polarity + ─►│ ground 
 Ground truth is the star rating only (Yelp has no aspect labels): 1–2★ = negative, 3★ = neutral,
 4–5★ = positive.
 
-## Monorepo layout (uv workspace)
+## Tech stack
 
-| Path | Package | Role |
-|---|---|---|
-| `packages/yelp-core` | `yelp_core` | Data contracts, settings, LLM clients (ASU Voyager, NVIDIA NIM, Hugging Face, Ollama, offline mock) |
-| `packages/yelp-scoring` | `yelp_scoring` | Grounding, scoring formulas, cross-validated star model |
-| `packages/yelp-data` | `yelp_data` | Reservoir-samples reviews per star rating, or whole restaurants with several reviews each, straight out of `yelp_dataset.tar` (scans all ~7M reviews in ~20 s, extracts nothing) |
-| `packages/yelp-agents` | `yelp_agents` | Aspect agents ×3, arbiter, lead agent, orchestrator (parallel, resumable) |
-| `packages/yelp-eval` | `yelp_eval` | Metrics with confidence intervals; within-restaurant review comparison; 3-D plot for the CLI |
-| `apps/cli` | `yelp-agents` | `providers`, `sample`, `sample-restaurants`, `run`, `eval`, `compare`, `viz` |
-| `apps/web` | `yelp-web` | FastAPI API + web UI (Analyze / Explore / Compare / Metrics) |
+| Layer | Technology | Where | How it's used |
+|---|---|---|---|
+| Language | Python ≥ 3.10 (developed on 3.12) | everywhere | All logic, scoring and statistics |
+| Workspace and packaging | [uv](https://docs.astral.sh/uv/) workspace, hatchling | `pyproject.toml` at the root and in each package | `uv sync` installs the 5 packages and 2 apps in editable mode; `uv run` runs commands in that environment |
+| LLM | ASU Voyager LLM API (OpenAI-compatible), model `gemma4-31b-it` | `packages/yelp-core/src/yelp_core/llm.py` | Plain HTTPS calls with `requests` to `/v1/chat/completions` in JSON mode, temperature 0.1, with retries. NVIDIA NIM, the Hugging Face router, local Ollama and an offline mock are alternatives. |
+| Concurrency | `concurrent.futures.ThreadPoolExecutor` | `packages/yelp-agents/src/yelp_agents/orchestrator.py` | The 3 aspect agents run in parallel per review, and `--workers` reviews run at once |
+| Text matching | `difflib.SequenceMatcher` | `packages/yelp-scoring/src/yelp_scoring/grounding.py` | Checks that each quoted phrase is really in the review (near-exact, ≥ 85%) |
+| Data | Yelp Open Dataset (`yelp_dataset.tar`), `tarfile` streaming, JSONL files | `packages/yelp-data/src/yelp_data/sampler.py` | One streaming pass with reservoir sampling; samples and results are saved as JSON lines |
+| Statistics and ML | NumPy, pandas, scikit-learn, SciPy | `packages/yelp-scoring/.../star_model.py`, `packages/yelp-eval/` | Ridge regression with `cross_val_predict`; classification metrics; Pearson and Spearman; F distribution for ANOVA; ICC(1) |
+| Charts | Plotly (Python) and plotly.js 2.35.2 (CDN); Matplotlib in the notebook | `packages/yelp-eval/.../figures.py`, `apps/web/.../static/app.js` | 3-D aspect-space scatter for `yelp-agents viz` and the Explore tab |
+| Command line | `argparse` | `apps/cli/src/yelp_cli/main.py` | The `yelp-agents` command and its subcommands |
+| Web backend | FastAPI, Uvicorn, Pydantic, Server-Sent Events | `apps/web/src/yelp_web/server.py` | JSON API; `/api/analyze` streams each agent's result as it finishes |
+| Web frontend | HTML, CSS and plain JavaScript (no framework or build step) | `apps/web/src/yelp_web/static/` | Single page with Analyze, Explore, Compare and Metrics tabs; light and dark themes; only renders numbers the API returns |
+| Tests | pytest, httpx (FastAPI `TestClient`) | `tests/` | 40 tests with the offline mock: no API key or dataset needed |
+| Notebook | Google Colab, the `openai` client library, Colab Secrets, Google Drive | `notebooks/yelp_aspect_agents_colab.ipynb` | The same pipeline in one notebook for teaching |
+
+Installed versions at the last run: FastAPI 0.141, Uvicorn 0.54, Pydantic 2.13, requests 2.34, NumPy 2.5,
+pandas 3.0, scikit-learn 1.9, SciPy 1.18, Plotly 7.1, pytest 9.1.
+
+## Codebase walkthrough
+
+```
+yelp-aspect-agents/
+├── pyproject.toml            uv workspace root: lists the 7 members, dev tools (pytest, httpx)
+├── .env.example              copy to .env and add your Voyager key (git-ignored)
+├── packages/                 libraries; each layer imports only the layers below it
+│   ├── yelp-core/            bottom layer, imported by everything
+│   │   ├── schemas.py        Review, Mention, AspectResult, OverallResult, ReviewAnalysis
+│   │   ├── config.py         Settings.from_env(): keys, models, temperature, retries, .env reader
+│   │   └── llm.py            LLMClient + ASU/NVIDIA/HF, Ollama and mock clients; build_llm(); extract_json()
+│   ├── yelp-scoring/         pure Python, no LLM
+│   │   ├── grounding.py      ground_quote(): is the quote really in the review?
+│   │   ├── scoring.py        mention value, aspect score and label, overall score, rule-based stars
+│   │   └── star_model.py     StarModel: ridge regression, out-of-fold predictions
+│   ├── yelp-data/
+│   │   └── sampler.py        sample_from_tar() (per star), sample_restaurants_from_tar(), JSONL I/O
+│   ├── yelp-agents/
+│   │   ├── prompts.py        every prompt: aspect definitions, rubric, few-shot examples
+│   │   ├── base.py           Agent.messages(): system + examples + request
+│   │   ├── aspect.py         AspectAgent: quotes for one aspect -> AspectResult
+│   │   ├── arbiter.py        ArbiterAgent: which aspect owns a disputed passage
+│   │   ├── aggregator.py     AggregatorAgent (the lead agent): overall verdict, with a fallback
+│   │   └── orchestrator.py   Orchestrator: runs the team per review; batch runs, resumable JSONL
+│   └── yelp-eval/
+│       ├── metrics.py        evaluate(): accuracy, CIs, confusion matrix, star errors, per-aspect stats
+│       ├── compare.py        compare_restaurants(): agreement, verdicts, ANOVA, ICC(1)
+│       └── figures.py        3-D Plotly scatter for `yelp-agents viz`
+├── apps/
+│   ├── cli/main.py           yelp-agents: providers, sample, sample-restaurants, run, eval, compare, viz
+│   └── web/                  yelp-web
+│       ├── server.py         FastAPI app: /api/status, analyze (SSE), results, metrics, compare, runs
+│       └── static/           index.html, app.js, styles.css
+├── notebooks/                the Colab notebook
+├── tests/                    test_scoring, test_pipeline, test_compare, test_llm_backends, test_web
+├── data/                     samples you draw (git-ignored)
+└── outputs/                  results and metrics (git-ignored)
+```
+
+(Each package's code lives in `packages/<name>/src/<name_with_underscores>/`; the tree shortens those paths.)
+
+**Follow one review through the code:**
+
+1. `yelp-agents sample` (`cli/main.py` → `sample_from_tar()`) streams the tar and writes `data/sample_reviews.jsonl`.
+2. `yelp-agents run` loads it with `load_reviews()` and calls `Orchestrator.run()`, which sends batches of
+   reviews to a thread pool.
+3. For each review, `Orchestrator.analyze_steps()` runs the three `AspectAgent`s in parallel. Each builds its
+   prompt from `prompts.py` and calls `LLMClient.chat_json()`.
+4. Each agent hands the model's mentions to `build_aspect_result()`, which runs `ground_quote()` on every quote,
+   drops duplicates and computes the aspect score.
+5. `find_conflicts()` finds quotes two aspects share. `ArbiterAgent` settles each one, and `rescore()` updates
+   the aspect that lost.
+6. `AggregatorAgent` gives the overall verdict, and `build_overall()` turns it into the overall score and
+   rule-based stars.
+7. The finished `ReviewAnalysis` is appended to `outputs/results.jsonl` as one JSON line.
+8. `yelp-agents eval` (`evaluate()`), `yelp-agents compare` (`compare_restaurants()`) and the web server
+   (`server.py`) all read that file. None of them call the LLM again.
 
 ## Setup for ASU students
 
@@ -147,6 +217,21 @@ What `compare` computes (all Python, `packages/yelp-eval/src/yelp_eval/compare.p
 * **Metrics**: accuracy with a 95% CI, macro-F1, star error for the rule and the calibrated model,
   quote grounding rate, confusion matrix, per-class precision/recall/F1, per-dimension mention rate
   and Spearman ρ vs stars, and a business table.
+
+## Colab notebook
+
+[`notebooks/yelp_aspect_agents_colab.ipynb`](notebooks/yelp_aspect_agents_colab.ipynb)
+([open in Colab](https://colab.research.google.com/github/manastole03/Grader_Project/blob/main/yelp-aspect-agents/notebooks/yelp_aspect_agents_colab.ipynb)) is a self-contained teaching version of the pipeline. It calls the same model
+(`gemma4-31b-it` on Voyager) with the project's prompts and quote checking, copied verbatim from the
+packages. It uses the same formulas, samplers and statistics, and with seed 42 draws exactly the same
+reviews as `sample` and `sample-restaurants`.
+
+- **API key:** store it as a Colab secret named `VOYAGER_API_KEY`; the notebook never prints it.
+- **Data:** `yelp_dataset.tar` in Google Drive (one streaming pass draws both samples), uploaded JSONL
+  samples, or 8 made-up demo reviews.
+- **Results:** saved to `My Drive/yelp_aspect_agents/` and resumed after a disconnect.
+- **Connection:** the API answered without the ASU VPN in testing (only the Voyager website needs it).
+  If Colab can't connect, run the notebook locally with the VPN on.
 
 ## LLM backends
 
