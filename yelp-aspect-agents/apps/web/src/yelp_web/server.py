@@ -8,6 +8,8 @@
                                (start, agent_start, aspect, arbiter, aggregator_start, overall, done)
   GET  /api/results            every analysis so far, with out-of-fold calibrated stars
   GET  /api/metrics            evaluation vs stars (with 95% CIs) + business roll-up
+  GET  /api/compare            reviews of the same restaurant compared, per aspect (from the
+                               restaurant sample's results when they exist, else from /api/results)
   POST /api/runs               start a batch run over the sample in the background
   GET  /api/runs/current       progress of that batch run
 """
@@ -34,6 +36,7 @@ from yelp_core import ASPECTS, LLMClient, Review, ReviewAnalysis, Settings, buil
 from yelp_core.llm import LLMError, OllamaClient
 from yelp_data import load_reviews
 from yelp_eval import business_rollup, evaluate, load_results
+from yelp_eval.compare import compare_restaurants
 from yelp_scoring import StarModel
 
 STATIC = Path(__file__).parent / "static"
@@ -58,12 +61,13 @@ class RunRequest(BaseModel):
 
 
 class State:
-    def __init__(self, sample_path: Path, results_path: Path):
+    def __init__(self, sample_path: Path, results_path: Path, compare_path: Path | None = None):
         self.sample_path = sample_path
         self.results_path = results_path
+        self.compare_path = compare_path
         self._llms: dict[str, LLMClient] = {}
         self._lock = threading.Lock()
-        self._cache: dict[str, tuple[float, Any]] = {}
+        self._cache: dict[str, tuple[tuple[str, float], Any]] = {}
         self.job: dict[str, Any] = {"running": False}
 
     def llm(self, provider: str | None) -> LLMClient:
@@ -78,12 +82,13 @@ class State:
                 self._llms[key] = build_llm(s)
             return self._llms[key]
 
-    def _cached(self, name: str, build) -> Any:
-        """Recompute derived data only when the results file changes."""
-        mtime = self.results_path.stat().st_mtime if self.results_path.exists() else 0.0
+    def _cached(self, name: str, build, path: Path | None = None) -> Any:
+        """Recompute derived data only when its source file (default: the results file) changes."""
+        path = path or self.results_path
+        stamp = (str(path), path.stat().st_mtime if path.exists() else 0.0)
         hit = self._cache.get(name)
-        if hit is None or hit[0] != mtime:
-            self._cache[name] = (mtime, build())
+        if hit is None or hit[0] != stamp:
+            self._cache[name] = (stamp, build())
         return self._cache[name][1]
 
     def results(self) -> list[ReviewAnalysis]:
@@ -91,6 +96,20 @@ class State:
 
     def metrics(self) -> dict[str, Any]:
         return self._cached("metrics", lambda: evaluate(self.results()))
+
+    def compare_source(self) -> Path:
+        """The restaurant sample's results if they exist, so the Compare tab works next to the
+        stratified sample; otherwise the main results file."""
+        p = self.compare_path
+        return p if p is not None and p.exists() else self.results_path
+
+    def compare_results(self) -> list[ReviewAnalysis]:
+        src = self.compare_source()
+        return self._cached("compare_results", lambda: load_results(src) if src.exists() else [], src)
+
+    def comparison(self) -> dict[str, Any]:
+        src = self.compare_source()
+        return self._cached("compare", lambda: compare_restaurants(self.compare_results()), src)
 
     def star_model(self) -> StarModel | None:
         rs = self.results()
@@ -117,9 +136,9 @@ def _clean(obj: Any) -> Any:
     return obj
 
 
-def create_app(sample_path: Path, results_path: Path) -> FastAPI:
+def create_app(sample_path: Path, results_path: Path, compare_path: Path | None = None) -> FastAPI:
     app = FastAPI(title="Yelp Aspect Agents")
-    st = State(sample_path, results_path)
+    st = State(sample_path, results_path, compare_path)
     app.state.yelp = st
 
     @app.get("/")
@@ -214,6 +233,13 @@ def create_app(sample_path: Path, results_path: Path) -> FastAPI:
         out["businesses"] = json.loads(biz.to_json(orient="records")) if len(biz) else []
         return _clean(out)
 
+    @app.get("/api/compare")
+    def compare() -> dict[str, Any]:
+        c = st.comparison()
+        ids = {i for x in c["restaurants"] for i in x["review_ids"]}
+        reviews = [r.to_dict() for r in st.compare_results() if r.review.review_id in ids]
+        return _clean({**c, "source": str(st.compare_source()), "reviews": reviews})
+
     @app.post("/api/runs")
     def start_run(req: RunRequest) -> dict[str, Any]:
         if st.job.get("running"):
@@ -260,11 +286,17 @@ def main() -> None:
     p = argparse.ArgumentParser(prog="yelp-web")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
-    p.add_argument("--sample", type=Path, default=Path("data/sample_reviews.jsonl"))
-    p.add_argument("--results", type=Path, default=Path("outputs/results.jsonl"))
+    p.add_argument("--restaurants", action="store_true",
+                   help="use the restaurant sample (sample-restaurants) and its results in every tab")
+    p.add_argument("--sample", type=Path)
+    p.add_argument("--results", type=Path)
+    p.add_argument("--compare-results", type=Path, default=Path("outputs/restaurant_results.jsonl"),
+                   help="results the Compare tab reads (falls back to --results if missing)")
     a = p.parse_args()
+    a.sample = a.sample or Path("data/restaurant_reviews.jsonl" if a.restaurants else "data/sample_reviews.jsonl")
+    a.results = a.results or Path("outputs/restaurant_results.jsonl" if a.restaurants else "outputs/results.jsonl")
     print(f"Yelp Aspect Agents UI -> http://{a.host}:{a.port}")
-    uvicorn.run(create_app(a.sample, a.results), host=a.host, port=a.port, log_level="warning")
+    uvicorn.run(create_app(a.sample, a.results, a.compare_results), host=a.host, port=a.port, log_level="warning")
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@
     <nav class="tabs" role="tablist">
       <button role="tab" data-tab="analyze" aria-selected="true">Analyze</button>
       <button role="tab" data-tab="explore" aria-selected="false">Explore</button>
+      <button role="tab" data-tab="compare" aria-selected="false">Compare</button>
       <button role="tab" data-tab="metrics" aria-selected="false">Metrics</button>
     </nav>
     <div class="backend">
@@ -112,6 +113,13 @@
     </div>
   </section>
 
+  <!-- COMPARE -->
+  <section class="view" id="view-compare" hidden>
+    <h2>Compare reviews of the same restaurant</h2>
+    <p class="lede">Each restaurant's reviews are lined up aspect by aspect. For each aspect you see which reviewers mention it, whether they agree, and the quotes that pull furthest apart. The summary table shows whether reviewers of the same restaurant agree more than reviewers of different restaurants.</p>
+    <div id="compare-body"></div>
+  </section>
+
   <!-- METRICS -->
   <section class="view" id="view-metrics" hidden>
     <h2>How well do the agents agree with reviewers?</h2>
@@ -119,5 +127,6 @@
     <div id="metrics-body"></div>
   </section>
 </main>
+<div class="tip" id="tip" role="tooltip" hidden></div>
 </body>
 </html>

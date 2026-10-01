@@ -80,3 +80,18 @@ def test_bad_key_fails_fast_without_retries(monkeypatch):
     with pytest.raises(PermissionError, match="API key"):
         build_llm(settings(asu_api_key=FAKE_KEY)).chat([{"role": "user", "content": "x"}])
     assert len(calls) == 1
+
+
+def test_dotenv_strips_inline_comments_and_quotes(monkeypatch, tmp_path):
+    from yelp_core.config import load_dotenv
+    env = tmp_path / ".env"
+    env.write_text("API_KEY=sk-abc123                # or ASU_API_KEY\n"
+                   "ASU_MODEL=\"gemma4-31b-it\"  # quoted\n"
+                   "LLM_MODEL=            # overrides the model\n"
+                   "HF_TOKEN='a#b'\n")
+    for k in ("API_KEY", "ASU_MODEL", "LLM_MODEL", "HF_TOKEN"):
+        monkeypatch.delenv(k, raising=False)
+    load_dotenv(env)
+    import os
+    assert os.environ["API_KEY"] == "sk-abc123" and os.environ["ASU_MODEL"] == "gemma4-31b-it"
+    assert os.environ["LLM_MODEL"] == "" and os.environ["HF_TOKEN"] == "a#b"

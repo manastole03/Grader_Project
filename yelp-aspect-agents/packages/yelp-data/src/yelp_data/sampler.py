@@ -5,6 +5,10 @@ precedes review.json): businesses matching the category/city filter are indexed,
 then the *entire* review file is scanned once with reservoir sampling (Algorithm R),
 one reservoir per star rating. Every eligible review of a given star rating therefore
 has the same probability of being chosen, wherever it sits in the file.
+
+sample_restaurants_from_tar draws whole restaurants instead: a uniform random set of
+restaurants, then a uniform random set of reviews from each, so the reviews of one
+restaurant can be compared with each other.
 """
 from __future__ import annotations
 
@@ -30,6 +34,18 @@ class SampleConfig:
     max_chars: int = 2000             # review length window (characters of review text)
     min_chars: int = 40
     seed: int = 42
+
+
+@dataclass
+class RestaurantSampleConfig:
+    businesses: int = 50              # restaurants, uniform over those with enough eligible reviews
+    per_business: int = 10            # reviews per restaurant, uniform over its eligible reviews
+    category: str | None = "Restaurants"
+    city: str | None = None
+    max_chars: int = 2000
+    min_chars: int = 40
+    seed: int = 42
+    oversample: int = 3               # candidates drawn per slot, to replace restaurants that fall short
 
 
 @dataclass
@@ -122,6 +138,82 @@ def sample_from_tar(tar_path: str | Path, cfg: SampleConfig, log=print) -> tuple
     ]
     rng.shuffle(reviews)
     return reviews, stats
+
+
+def sample_restaurants_from_tar(tar_path: str | Path, cfg: RestaurantSampleConfig, log=print) -> list[Review]:
+    """cfg.businesses restaurants chosen uniformly at random, then cfg.per_business reviews of each.
+
+    Business pass: reservoir-sample oversample x businesses candidates among the businesses that
+    match the filter and list at least per_business reviews. Review pass: one reservoir per
+    candidate. Candidates are then taken in random order, skipping any with fewer than
+    per_business eligible reviews (rejection sampling), so the result is uniform over the
+    restaurants that have enough eligible reviews. Reviews are grouped by restaurant, oldest
+    first, so a partial run (`run -n`) covers whole restaurants.
+    """
+    rng = random.Random(cfg.seed)
+    k = cfg.per_business
+    slots = cfg.businesses * max(1, cfg.oversample)
+    candidates: list[dict] = []
+    matched = 0
+    reservoirs: dict[str, list[dict]] = {}
+    seen: dict[str, int] = {}
+    scanned = 0
+
+    with tarfile.open(tar_path, mode="r|*") as tar:
+        for info in tar:
+            name = Path(info.name).name
+            if name == BUSINESS_MEMBER:
+                for raw in _lines(tar, info):
+                    b = json.loads(raw)
+                    if not _business_ok(b, cfg) or (b.get("review_count") or 0) < k:
+                        continue
+                    matched += 1
+                    if len(candidates) < slots:
+                        candidates.append(b)
+                    else:
+                        j = rng.randrange(matched)
+                        if j < slots:
+                            candidates[j] = b
+                reservoirs = {b["business_id"]: [] for b in candidates}
+                seen = dict.fromkeys(reservoirs, 0)
+                log(f"{matched:,} businesses match the filter with >= {k} reviews; drew {len(candidates)} candidates")
+            elif name == REVIEW_MEMBER:
+                if not reservoirs:
+                    raise RuntimeError("no businesses matched (or review file precedes business file)")
+                for raw in _lines(tar, info):
+                    scanned += 1
+                    if scanned % 1_000_000 == 0:
+                        log(f"scanned {scanned:,} reviews")
+                    bid = _business_id(raw)
+                    if bid not in reservoirs:
+                        continue
+                    r = json.loads(raw)
+                    if not 1 <= int(round(float(r["stars"]))) <= 5:
+                        continue
+                    if not cfg.min_chars <= len((r.get("text") or "").strip()) <= cfg.max_chars:
+                        continue
+                    seen[bid] += 1
+                    res = reservoirs[bid]
+                    if len(res) < k:
+                        res.append(r)
+                    else:
+                        j = rng.randrange(seen[bid])
+                        if j < k:
+                            res[j] = r
+                break
+
+    rng.shuffle(candidates)
+    chosen = [b for b in candidates if seen[b["business_id"]] >= k][: cfg.businesses]
+    log(f"scanned {scanned:,} reviews; {len(chosen)} restaurants with >= {k} eligible reviews")
+    if len(chosen) < cfg.businesses:
+        log(f"warning: only {len(chosen)} of {cfg.businesses} restaurants have enough eligible reviews")
+    return [
+        Review(review_id=r["review_id"], business_id=r["business_id"], stars=float(int(round(float(r["stars"])))),
+               text=r["text"].strip(), business_name=b.get("name", ""), city=b.get("city", ""),
+               categories=b.get("categories", ""), date=r.get("date", ""),
+               business_stars=b.get("stars"), business_review_count=b.get("review_count"))
+        for b in chosen for r in sorted(reservoirs[b["business_id"]], key=lambda r: r.get("date", ""))
+    ]
 
 
 def write_reviews(reviews: list[Review], path: str | Path) -> None:

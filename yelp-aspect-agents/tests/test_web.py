@@ -46,6 +46,7 @@ def _wait_for_job(client):
 
 def test_ui_and_status(client):
     assert "Yelp Aspect Agents" in client.get("/").text
+    assert 'data-tab="compare"' in client.get("/").text
     for f in ("app.js", "styles.css"):
         assert client.get(f"/static/{f}").status_code == 200
     s = client.get("/api/status").json()
@@ -93,6 +94,13 @@ def test_batch_run_then_results_and_metrics(client):
     assert m["grounding"]["rate"] == 1.0 and m["businesses"]
     json.dumps(m, allow_nan=False)                 # strictly valid JSON (no NaN)
 
+    c = client.get("/api/compare").json()          # 4 businesses, 3-4 reviews each
+    assert c["summary"]["restaurants"] == 4 and c["summary"]["reviews"] == 15
+    assert sorted(len(x["review_ids"]) for x in c["restaurants"]) == [3, 4, 4, 4]
+    assert len(c["reviews"]) == 15 and c["source"].endswith("results.jsonl")
+    assert set(c["summary"]["aspects"]) == {"food", "service", "ambience"}
+    json.dumps(c, allow_nan=False)
+
     # a live analysis now also gets a calibrated star prediction
     done = dict(_events(client.post("/api/analyze", json={"text": "Great food.", "provider": "mock"}).text))["done"]
     assert done["calibrated_stars"] is not None and done["n_train"] == 15
@@ -100,3 +108,22 @@ def test_batch_run_then_results_and_metrics(client):
 
 def test_bad_provider_is_a_400(client):
     assert client.post("/api/analyze", json={"text": "hello there", "provider": "nvidia"}).status_code == 400
+
+
+def test_compare_reads_the_restaurant_results_when_present(tmp_path, monkeypatch):
+    from yelp_agents import Orchestrator
+    from yelp_core import Settings, build_llm
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    s = Settings()
+    s.provider = "mock"
+    restaurants = tmp_path / "restaurant_results.jsonl"
+    Orchestrator(build_llm(s)).run([Review(f"x{i}", "bx", 1 + i, TEXTS[1 + i], "Only Biz", "Reno", business_stars=3.5)
+                                    for i in range(4)], restaurants)
+    app = create_app(tmp_path / "sample.jsonl", tmp_path / "results.jsonl", restaurants)
+    client = TestClient(app)
+    assert client.get("/api/results").json() == []          # other tabs keep the main results
+    c = client.get("/api/compare").json()
+    assert c["source"] == str(restaurants) and [x["business"] for x in c["restaurants"]] == ["Only Biz"]
+    assert c["restaurants"][0]["yelp_stars"] == 3.5 and len(c["reviews"]) == 4
+    missing = TestClient(create_app(tmp_path / "s.jsonl", tmp_path / "results.jsonl", tmp_path / "nope.jsonl"))
+    assert missing.get("/api/compare").json()["restaurants"] == []   # falls back to the (empty) main results

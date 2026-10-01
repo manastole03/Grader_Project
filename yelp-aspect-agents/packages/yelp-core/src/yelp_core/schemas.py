@@ -6,7 +6,7 @@ polarity and a 1-3 intensity. Every numeric score is computed afterwards in Pyth
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import MISSING, asdict, dataclass, field
 from typing import Any
 
 # The three dimensions every review is projected onto.
@@ -37,6 +37,8 @@ class Review:
     city: str = ""
     categories: str = ""
     date: str = ""
+    business_stars: float | None = None        # the business's overall Yelp rating (all its reviews)
+    business_review_count: int | None = None
 
     @property
     def label(self) -> str:
@@ -44,7 +46,8 @@ class Review:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Review":
-        return cls(**{k: d.get(k, "") for k in cls.__dataclass_fields__})
+        return cls(**{k: d.get(k, "" if f.default is MISSING else f.default)
+                      for k, f in cls.__dataclass_fields__.items()})
 
 
 @dataclass

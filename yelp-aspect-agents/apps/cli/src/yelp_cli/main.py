@@ -2,8 +2,10 @@
 
   yelp-agents providers                     show which LLM backend would be used
   yelp-agents sample --tar ... -n 100       stream a stratified sample out of the Yelp tar
+  yelp-agents sample-restaurants -b 50 -k 10  50 random restaurants x 10 reviews each
   yelp-agents run    -n 20                  run the agent team over the sample
   yelp-agents eval                          metrics vs stars + business roll-up
+  yelp-agents compare                       reviews of the same restaurant, side by side
   yelp-agents viz                           interactive 3-D (food, service, ambience) plot
 
 Web UI: `uv run yelp-web`
@@ -20,6 +22,8 @@ from yelp_core import Settings, build_llm
 DEFAULT_TAR = Path.home() / "Downloads" / "Yelp JSON" / "yelp_dataset.tar"
 DEFAULT_SAMPLE = Path("data/sample_reviews.jsonl")
 DEFAULT_RESULTS = Path("outputs/results.jsonl")
+RESTAURANT_SAMPLE = Path("data/restaurant_reviews.jsonl")
+RESTAURANT_RESULTS = Path("outputs/restaurant_results.jsonl")
 
 
 def _settings(args: argparse.Namespace) -> Settings:
@@ -47,6 +51,16 @@ def cmd_sample(args: argparse.Namespace) -> None:
     reviews, _ = sample_from_tar(args.tar, cfg, log=lambda m: print(f"  {m}", file=sys.stderr))
     write_reviews(reviews, args.out)
     print(f"wrote {len(reviews)} reviews -> {args.out}")
+
+
+def cmd_sample_restaurants(args: argparse.Namespace) -> None:
+    from yelp_data import RestaurantSampleConfig, sample_restaurants_from_tar, write_reviews
+    cfg = RestaurantSampleConfig(businesses=args.businesses, per_business=args.per_business,
+                                 category=args.category or None, city=args.city, seed=args.seed)
+    reviews = sample_restaurants_from_tar(args.tar, cfg, log=lambda m: print(f"  {m}", file=sys.stderr))
+    write_reviews(reviews, args.out)
+    print(f"wrote {len(reviews)} reviews of {len({r.business_id for r in reviews})} restaurants -> {args.out}")
+    print(f"next: yelp-agents run --sample {args.out} --out {RESTAURANT_RESULTS}")
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -90,6 +104,24 @@ def cmd_eval(args: argparse.Namespace) -> None:
         print(f"\nmetrics json -> {args.json}")
 
 
+def cmd_compare(args: argparse.Namespace) -> None:
+    from yelp_eval import load_results
+    from yelp_eval.compare import compare_restaurants, format_comparison, format_restaurant
+    results = load_results(args.results)
+    c = compare_restaurants(results, min_reviews=args.min_reviews)
+    if args.restaurant:
+        q = args.restaurant.lower()
+        hits = [x for x in c["restaurants"] if q in x["business"].lower()]
+        if not hits:
+            sys.exit(f"no restaurant matching {args.restaurant!r}")
+        print("\n\n".join(format_restaurant(x, results) for x in hits))
+    else:
+        print(format_comparison(c, top=args.top))
+    if args.json:
+        Path(args.json).write_text(json.dumps(c, indent=2, default=float))
+        print(f"\ncomparison json -> {args.json}")
+
+
 def cmd_viz(args: argparse.Namespace) -> None:
     from yelp_eval import load_results, results_frame
     from yelp_eval.figures import aspect_space_3d
@@ -121,6 +153,16 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--out", type=Path, default=DEFAULT_SAMPLE)
     sp.set_defaults(fn=cmd_sample)
 
+    sp = sub.add_parser("sample-restaurants", help="random restaurants, several reviews of each")
+    sp.add_argument("--tar", type=Path, default=DEFAULT_TAR)
+    sp.add_argument("-b", "--businesses", type=int, default=50, help="restaurants to sample")
+    sp.add_argument("-k", "--per-business", type=int, default=10, help="reviews per restaurant")
+    sp.add_argument("--category", default="Restaurants", help="'' to disable")
+    sp.add_argument("--city")
+    sp.add_argument("--seed", type=int, default=42)
+    sp.add_argument("--out", type=Path, default=RESTAURANT_SAMPLE)
+    sp.set_defaults(fn=cmd_sample_restaurants)
+
     sp = sub.add_parser("run", help="run the agent team")
     llm_flags(sp)
     sp.add_argument("--sample", type=Path, default=DEFAULT_SAMPLE)
@@ -138,6 +180,14 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--top", type=int, default=15)
     sp.add_argument("--json", type=Path, help="also write metrics to this file")
     sp.set_defaults(fn=cmd_eval)
+
+    sp = sub.add_parser("compare", help="compare the reviews of each restaurant")
+    sp.add_argument("--results", type=Path, default=RESTAURANT_RESULTS)
+    sp.add_argument("--min-reviews", type=int, default=2)
+    sp.add_argument("--top", type=int, help="only the first N restaurants (most contested first)")
+    sp.add_argument("--restaurant", help="show one restaurant's reviews side by side (name substring)")
+    sp.add_argument("--json", type=Path, help="also write the comparison to this file")
+    sp.set_defaults(fn=cmd_compare)
 
     sp = sub.add_parser("viz", help="3-D scatter HTML")
     sp.add_argument("--results", type=Path, default=DEFAULT_RESULTS)

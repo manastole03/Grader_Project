@@ -2,6 +2,7 @@
 // Rendering only: every score, star prediction, label and metric comes from the Python API.
 
 const ASPECTS = ["food", "service", "ambience"];
+const TABS = ["analyze", "explore", "compare", "metrics"];
 const GLYPHS = {
   food: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M7 3v8M4 3v5a3 3 0 0 0 6 0V3M7 11v10M17 21V3c-2.5 1.5-4 4-4 8h4"/></svg>',
   service: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 17h16M6 17a6 6 0 0 1 12 0M12 8V6M10 6h4M3 20h18"/></svg>',
@@ -25,6 +26,12 @@ const state = {
   loadedText: "",
   loadedId: null,
   pollTimer: null,
+  compare: null,         // /api/compare payload
+  compareById: new Map(),  // review_id -> analysis, for the restaurants in the comparison
+  compareSel: null,      // business_id shown in the Compare detail
+  compareSearch: "",
+  compareSort: "contested",
+  openReview: null,      // review expanded in the Compare side-by-side table
 };
 
 /* ---------------- helpers ---------------- */
@@ -37,6 +44,8 @@ const pct = (x) => (x === null || x === undefined ? "—" : `${Math.round(x * 10
 const signed = (x) => (x > 0 ? "+" : x < 0 ? "−" : "") + Math.abs(x).toFixed(2);
 const starsText = (s) => "★".repeat(Math.round(s)) + "☆".repeat(5 - Math.round(s));
 const trunc = (s, n) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
+const cap = (s) => s[0].toUpperCase() + s.slice(1);
+const pval = (p) => (p == null ? "—" : p < 0.001 ? "<0.001" : p.toFixed(3));
 
 async function api(path, opts = {}) {
   const r = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
@@ -125,6 +134,7 @@ function showTab(name) {
   try { localStorage.setItem("tab", name); } catch (_) {}
   if (location.hash.slice(1) !== name) history.replaceState(null, "", `#${name}`);
   if (name === "explore") loadResults();
+  if (name === "compare") loadCompare();
   if (name === "metrics") loadMetrics();
 }
 
@@ -421,6 +431,238 @@ function pollJob() {
   tick();
 }
 
+/* ---------------- compare ---------------- */
+const CONSENSUS_LABEL = { positive: "Positive", negative: "Negative", neutral: "Neutral", mixed: "Mixed", too_few: "Too few mentions" };
+
+function consensusChip(c) {
+  return `<span class="chip ${c === "too_few" ? "not_mentioned" : esc(c)}">${esc(CONSENSUS_LABEL[c] || c)}</span>`;
+}
+
+/** A restaurant's mean score on one aspect, with the share of its reviewers on the majority side. */
+function meanCell(b) {
+  if (b.mean == null) return '<span class="cell-score na">—</span>';
+  const cls = b.mean > 0 ? "positive" : b.mean < 0 ? "negative" : "neutral";
+  return `<span class="cell-score ${cls}"><i class="dot"></i>${signed(b.mean)}</span>` +
+    `<span class="agree" title="${b.mentioned} reviews mention it">${b.agreement == null ? `n=${b.mentioned}` : `${pct(b.agreement)} agree`}</span>`;
+}
+
+async function loadCompare() {
+  const body = $("#compare-body");
+  let c;
+  try { c = await api("/api/compare"); }
+  catch (e) {
+    body.innerHTML = `<div class="card empty">Couldn't load the comparison (${esc(e.message)}).<br>If the server was started before the Compare tab existed, restart it: <code>uv run yelp-web</code></div>`;
+    return;
+  }
+  state.compare = c;
+  state.compareById = new Map(c.reviews.map((r) => [r.review.review_id, r]));
+  if (!c.restaurants.length) {
+    body.innerHTML = `<div class="card empty">No restaurant has two or more analyzed reviews yet. Draw a restaurant sample, run the agents on it, and open the UI on those results:<br><br>
+      <code>uv run yelp-agents sample-restaurants -b 50 -k 10</code><br><br>
+      <code>uv run yelp-agents run --sample data/restaurant_reviews.jsonl --out outputs/restaurant_results.jsonl</code><br><br>
+      <code>uv run yelp-web</code></div>`;
+    return;
+  }
+  if (!c.restaurants.some((x) => x.business_id === state.compareSel)) state.compareSel = c.restaurants[0].business_id;
+  body.innerHTML = `${compareSummary(c.summary)}
+    <div class="card list-card">
+      <div class="row">
+        <h3 class="section" style="margin:0">Restaurants</h3><span class="spacer"></span>
+        <input type="search" id="compare-search" placeholder="Filter by name, city or cuisine…" aria-label="Filter restaurants" value="${esc(state.compareSearch)}">
+        <select id="compare-sort" aria-label="Sort restaurants">
+          <option value="contested">Most contested first</option><option value="yelp">Yelp rating</option><option value="name">Name</option>
+        </select>
+      </div>
+      <div class="list-scroll"><table id="restaurant-table">
+        <thead><tr><th>Restaurant</th><th class="num">Yelp ★</th><th class="num">Sampled ★</th>
+          ${ASPECTS.map((a) => `<th>${cap(a)}</th>`).join("")}<th>Reviewers disagree on</th></tr></thead>
+        <tbody></tbody></table></div>
+      <p class="small muted" style="margin:10px 0 0">Each aspect shows the mean score over the reviews that mention it, and the share of those reviewers on the majority side. Reviewers disagree on an aspect when at least one is positive and one is negative. Select a restaurant to compare its reviews.</p>
+    </div>
+    <div id="restaurant-detail"></div>`;
+  $("#compare-sort").value = state.compareSort;
+  $("#compare-search").addEventListener("input", (e) => { state.compareSearch = e.target.value; renderRestaurantList(); });
+  $("#compare-sort").addEventListener("change", (e) => { state.compareSort = e.target.value; renderRestaurantList(); });
+  const pick = (tr) => {
+    state.compareSel = tr.dataset.bid; state.openReview = null; renderRestaurantList(); renderRestaurant();
+    $("#restaurant-detail").scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+  $("#restaurant-table tbody").addEventListener("click", (e) => { const tr = e.target.closest("tr[data-bid]"); if (tr) pick(tr); });
+  $("#restaurant-table tbody").addEventListener("keydown", (e) => { const tr = e.target.closest("tr[data-bid]"); if (tr && e.key === "Enter") pick(tr); });
+  $("#restaurant-detail").addEventListener("click", (e) => {
+    const dot = e.target.closest(".sdot");
+    const tr = e.target.closest("tr[data-id]");
+    const id = dot?.dataset.id || tr?.dataset.id;
+    if (!id) return;
+    state.openReview = dot || state.openReview !== id ? id : null;
+    renderMatrix();
+    if (dot) $(`#review-matrix tr[data-id="${CSS.escape(id)}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+  });
+  renderRestaurantList();
+  renderRestaurant();
+}
+
+function compareSummary(s) {
+  const tile = (label, value, sub) => `<div class="card tile"><div class="label">${label}</div><div class="value">${value}</div><div class="sub">${sub}</div></div>`;
+  const st = s.stars, sy = s.sample_vs_yelp, sa = s.stars_anova;
+  const rows = ASPECTS.map((a) => {
+    const v = s.aspects[a], c = v.consensus;
+    return `<tr><td><b>${cap(a)}</b></td>
+      <td class="num">${v.restaurants_compared} / ${s.restaurants}</td>
+      <td class="num">${fmt(v.within_sd)}</td><td class="num">${fmt(v.between_sd)}</td>
+      <td class="num">${fmt(v.anova.icc1)}</td><td class="num">${pval(v.anova.p)}</td>
+      <td class="num">${v.contested} / ${s.restaurants}</td>
+      <td class="small">${c.positive} positive · ${c.negative} negative · ${c.neutral} neutral · ${c.mixed} mixed</td>
+      <td class="num" title="Spearman over ${v.vs_yelp_stars.n} restaurants, p = ${pval(v.vs_yelp_stars.spearman_p)}">${fmt(v.vs_yelp_stars.spearman)}</td></tr>`;
+  }).join("");
+  return `
+    <div class="tiles">
+      ${tile("Restaurants", s.restaurants, `${s.reviews} reviews · ${fmt(s.reviews_per_restaurant, 0)} per restaurant`)}
+      ${tile("With a contested aspect", s.restaurants_contested, "a positive and a negative reviewer on the same aspect")}
+      ${tile("Star error per restaurant", fmt(st.restaurant_mae), `MAE of the mean prediction · ${fmt(st.review_mae)} per single review`)}
+      ${tile("Sample vs Yelp rating", fmt(sy.pearson), `Pearson r, sampled mean vs Yelp's rating · MAE ${fmt(sy.mae)}`)}
+    </div>
+    <div class="card table-wrap"><h3 class="section">Do reviewers of the same restaurant agree?</h3>
+      <table class="static"><thead><tr><th>Dimension</th><th class="num">Compared</th><th class="num">Within-restaurant sd</th><th class="num">Between-restaurant sd</th>
+        <th class="num">ICC(1)</th><th class="num">ANOVA p</th><th class="num">Contested</th><th>Verdict per restaurant</th><th class="num">ρ vs Yelp ★</th></tr></thead>
+      <tbody>${rows}
+        <tr><td><b>Reviewer stars</b><div class="small muted">baseline, 1–5 scale</div></td><td class="num">${sa.groups} / ${s.restaurants}</td><td class="num">—</td><td class="num">—</td>
+          <td class="num">${fmt(sa.icc1)}</td><td class="num">${pval(sa.p)}</td><td></td><td></td><td></td></tr>
+      </tbody></table>
+      <p class="small muted" style="margin:12px 0 0">Scores run from −1 to +1 and only count reviews that mention the aspect. <b>Compared</b> is the number of restaurants with at least ${s.min_compare} such reviews. <b>ICC(1)</b> is the share of score variance that lies between restaurants: 0 means reviewers of the same place agree no more than strangers, and 1 means they agree completely. A verdict needs ${pct(s.consensus_threshold)} of those reviewers on one side; below that it is <i>mixed</i>. <b>ρ vs Yelp ★</b> is the Spearman correlation between a restaurant's mean aspect score and its overall Yelp rating.</p>
+    </div>`;
+}
+
+function sortedRestaurants() {
+  const q = state.compareSearch.toLowerCase();
+  let xs = state.compare.restaurants.filter((x) => !q || `${x.business} ${x.city} ${x.categories}`.toLowerCase().includes(q));
+  if (state.compareSort === "yelp") xs = [...xs].sort((a, b) => (b.yelp_stars ?? -1) - (a.yelp_stars ?? -1) || a.business.localeCompare(b.business));
+  if (state.compareSort === "name") xs = [...xs].sort((a, b) => a.business.localeCompare(b.business));
+  return xs; // default: server order, most contested first
+}
+
+function renderRestaurantList() {
+  const xs = sortedRestaurants();
+  const tb = $("#restaurant-table tbody");
+  if (!xs.length) { tb.innerHTML = '<tr><td colspan="7" class="muted">No restaurant matches.</td></tr>'; return; }
+  tb.innerHTML = xs.map((x) => `
+    <tr data-bid="${esc(x.business_id)}" class="${x.business_id === state.compareSel ? "sel" : ""}" tabindex="0">
+      <td><b>${esc(x.business)}</b><div class="small muted">${esc(x.city)} · ${x.reviews} reviews</div></td>
+      <td class="num">${x.yelp_stars == null ? "—" : fmt(x.yelp_stars, 1)}</td>
+      <td class="num">${fmt(x.stars.mean, 1)}</td>
+      ${ASPECTS.map((a) => `<td class="nowrap">${meanCell(x.aspects[a])}</td>`).join("")}
+      <td class="small">${x.contested.length ? esc(x.contested.join(", ")) : '<span class="muted">—</span>'}</td>
+    </tr>`).join("");
+}
+
+/** Dot plot on the −1…+1 axis: one dot per review that mentions the aspect; equal scores stack. */
+function strip(aspect, dots, mean) {
+  const placed = [];
+  for (const d of [...dots].sort((p, q) => p.score - q.score)) {
+    const x = ((d.score + 1) / 2) * 100;
+    let lvl = 0;
+    while (placed.some((p) => p.lvl === lvl && Math.abs(p.x - x) < 6)) lvl++;
+    placed.push({ ...d, x, lvl });
+  }
+  const h = (Math.max(...placed.map((p) => p.lvl)) + 1) * 14 + 10;
+  return `<div class="strip" style="height:${h}px" role="img" aria-label="${esc(`${cap(aspect)} scores of ${dots.length} reviews: ${dots.map((d) => signed(d.score)).join(", ")}`)}">
+      <i class="zero"></i>
+      ${mean == null ? "" : `<i class="mean" style="left:${((mean + 1) / 2) * 100}%"></i>`}
+      ${placed.map((p) => `<button class="sdot ${esc(p.sentiment)}${p.id === state.openReview ? " on" : ""}" style="left:${p.x}%;bottom:${6 + p.lvl * 14}px"
+          data-id="${esc(p.id)}" data-tip="${esc(`${signed(p.score)}|${p.stars}★ review · ${p.date}`)}"
+          aria-label="${esc(`${signed(p.score)}, ${p.stars}-star review from ${p.date}`)}"></button>`).join("")}
+    </div>
+    <div class="strip-axis small muted" aria-hidden="true"><span>−1</span><span>0</span><span>+1</span></div>`;
+}
+
+function aspectPanel(a, b, reviews) {
+  const dots = reviews.filter((r) => r.aspects[a].sentiment !== "not_mentioned" && !r.aspects[a].error)
+    .map((r) => ({ id: r.review.review_id, score: r.aspects[a].score, sentiment: r.aspects[a].sentiment,
+                   stars: r.review.stars, date: (r.review.date || "").slice(0, 10) }));
+  const quote = (q, cls) => (q ? `<p class="evidence ${cls}">“${esc(trunc(q.quote, 180))}”<span class="val">${signed(q.value)} · from a ${q.stars}★ review · ${esc(q.date)}</span></p>` : "");
+  const lab = b.labels;
+  const stats = [`${b.mentioned} of ${b.reviews} reviews mention it`];
+  if (b.agreement != null) stats.push(`${pct(b.agreement)} agree`);
+  if (b.mean != null) stats.push(`mean ${signed(b.mean)}${b.sd == null ? "" : ` (sd ${fmt(b.sd)})`}`);
+  return `<article class="card aspect-panel">
+    <header class="row"><span class="glyph">${GLYPHS[a]}</span><b>${cap(a)}</b><span class="spacer"></span>${consensusChip(b.consensus)}</header>
+    <p class="small muted" style="margin:0">${stats.join(" · ")}</p>
+    ${dots.length ? strip(a, dots, b.mean) : `<p class="small muted strip-empty">No reviewer mentions ${esc(a)}.</p>`}
+    <p class="small tally">${lab.positive} positive · ${lab.neutral} neutral · ${lab.negative} negative · ${lab.not_mentioned} silent</p>
+    ${b.most_positive || b.most_negative ? `<h4>${b.contested ? "Where reviewers disagree" : "Strongest quote"}</h4>` : ""}
+    ${quote(b.most_positive, "positive")}${quote(b.most_negative, "negative")}
+  </article>`;
+}
+
+function renderRestaurant() {
+  const el = $("#restaurant-detail");
+  const x = state.compare.restaurants.find((r) => r.business_id === state.compareSel);
+  if (!x) { el.innerHTML = '<div class="card empty small">Select a restaurant.</div>'; return; }
+  const reviews = x.review_ids.map((id) => state.compareById.get(id)).filter(Boolean);
+  const counts = [5, 4, 3, 2, 1].filter((s) => x.stars.counts[s]).map((s) => `${s}★ ×${x.stars.counts[s]}`).join(" · ");
+  const o = x.overall_labels;
+  el.innerHTML = `
+    <div class="card">
+      <h3 class="rname">${esc(x.business)}</h3>
+      <div class="small muted">${esc(x.city)}${x.categories ? ` · ${esc(trunc(x.categories, 100))}` : ""}</div>
+      <div class="rstats">
+        <div><span class="label">Yelp rating</span><b>${x.yelp_stars == null ? "—" : `${fmt(x.yelp_stars, 1)}★`}</b>
+          <span class="sub">${x.yelp_review_count ? `over ${x.yelp_review_count} reviews on Yelp` : "not recorded in this sample"}</span></div>
+        <div><span class="label">These ${x.reviews} reviews</span><b>${fmt(x.stars.mean, 1)}★</b><span class="sub">${counts}</span></div>
+        <div><span class="label">Lead agent, averaged</span><b>${fmt(x.predicted_stars, 1)}★</b>
+          <span class="sub">${o.positive} positive · ${o.neutral} neutral · ${o.negative} negative</span></div>
+      </div>
+    </div>
+    <div class="small muted strip-legend"><span>Each dot is one review that mentions the aspect:</span>
+      <span><i class="sym positive"></i>positive</span><span><i class="sym neutral"></i>neutral</span><span><i class="sym negative"></i>negative</span>
+      <span><i class="mean-key"></i>mean</span><span>· select a dot to open that review below</span></div>
+    <div class="aspect-grid">${ASPECTS.map((a) => aspectPanel(a, x.aspects[a], reviews)).join("")}</div>
+    <div class="card table-wrap"><h3 class="section">The ${x.reviews} reviews side by side</h3>
+      <table id="review-matrix"><thead><tr><th>Date</th><th class="num">Stars</th><th>Review</th>
+        ${ASPECTS.map((a) => `<th>${cap(a)}</th>`).join("")}<th>Overall</th><th class="num">Pred ★</th></tr></thead>
+      <tbody></tbody></table>
+    </div>`;
+  renderMatrix();
+}
+
+function renderMatrix() {
+  const x = state.compare.restaurants.find((r) => r.business_id === state.compareSel);
+  $("#review-matrix tbody").innerHTML = x.review_ids.map((id) => state.compareById.get(id)).filter(Boolean).map((r) => {
+    const id = r.review.review_id, open = id === state.openReview;
+    return `<tr data-id="${esc(id)}" class="${open ? "sel" : ""}" tabindex="0" aria-expanded="${open}">
+        <td class="nowrap">${esc((r.review.date || "").slice(0, 10))}</td><td class="num">${r.review.stars}★</td>
+        <td><div class="excerpt">${esc(r.review.text)}</div></td>
+        ${ASPECTS.map((a) => `<td>${cellScore(r.aspects[a])}</td>`).join("")}
+        <td>${chip(r.overall.sentiment)}</td><td class="num">${fmt(r.overall.stars_rule, 2)}</td>
+      </tr>` + (open ? `<tr class="expand"><td colspan="8">
+        <p class="highlighted small">${highlight(r.review.text, r.aspects)}</p>
+        <p class="small" style="margin:10px 0 0;color:var(--ink-2)"><b>Lead agent:</b> ${esc(r.overall.rationale)}</p>
+        ${(r.meta?.arbitrations || []).map(arbiterNote).join("")}</td></tr>` : "");
+  }).join("");
+  $$(".sdot").forEach((d) => d.classList.toggle("on", d.dataset.id === state.openReview));
+}
+
+/* one tooltip for every [data-tip] mark: "value|context"; the value leads */
+function initTip() {
+  const tip = $("#tip");
+  const show = (el) => {
+    const [value, rest] = el.dataset.tip.split("|");
+    const b = document.createElement("b");
+    b.textContent = value;
+    tip.replaceChildren(b, document.createTextNode(` ${rest || ""}`));
+    tip.hidden = false;
+    const r = el.getBoundingClientRect();
+    tip.style.left = `${Math.min(innerWidth - tip.offsetWidth - 8, Math.max(8, r.left + r.width / 2 - tip.offsetWidth / 2))}px`;
+    tip.style.top = `${Math.max(8, r.top - tip.offsetHeight - 10)}px`;
+  };
+  const hide = () => { tip.hidden = true; };
+  const on = (e) => { const el = e.target.closest?.("[data-tip]"); if (el) show(el); else hide(); };
+  document.addEventListener("pointerover", on);
+  document.addEventListener("focusin", on);
+  document.addEventListener("focusout", hide);
+  addEventListener("scroll", hide, { passive: true });
+}
+
 /* ---------------- metrics ---------------- */
 async function loadMetrics() {
   const body = $("#metrics-body");
@@ -480,6 +722,7 @@ async function loadMetrics() {
 /* ---------------- boot ---------------- */
 document.addEventListener("DOMContentLoaded", async () => {
   initTheme();
+  initTip();
   $$("nav.tabs button").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
   $("#random-btn").addEventListener("click", randomReview);
   $("#run-btn").addEventListener("click", runAgents);
@@ -496,10 +739,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   try { await loadStatus(); } catch (e) { toast(`Backend unreachable: ${e.message}`); }
   renderPipeline();
   let tab = location.hash.slice(1);
-  if (!["analyze", "explore", "metrics"].includes(tab)) {
+  if (!TABS.includes(tab)) {
     tab = "analyze";
     try { tab = localStorage.getItem("tab") || tab; } catch (_) {}
   }
   showTab(tab);
-  addEventListener("hashchange", () => { const t = location.hash.slice(1); if (["analyze", "explore", "metrics"].includes(t)) showTab(t); });
+  addEventListener("hashchange", () => { const t = location.hash.slice(1); if (TABS.includes(t)) showTab(t); });
 });
