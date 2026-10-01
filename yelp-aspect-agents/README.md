@@ -9,9 +9,9 @@ This builds on the *Prompting LLMs for Sentiment Analysis* notebook (Module 7). 
 zero-shot and few-shot prompting and chaining LLMs; this project extends those ideas to one agent per
 aspect.
 
-**Student guide:** [Yelp Aspect Agents: Setup & Walkthrough](https://claude.ai/code/artifact/64b65d5c-a008-4da9-8b42-7ca199c5c48b)
-covers setup (ASU VPN, Voyager API key), a step-by-step walkthrough, a code tour, the agents' prompts,
-the scoring and statistics, the results, and a glossary.
+**Demo guide:** [Yelp Aspect Agents: Live Demo Guide](https://claude.ai/code/artifact/7145e65d-09c9-47c4-8a76-d778d4ced031)
+has the run of show for presenting this project, talking points, results, likely questions, and setup
+steps for students who want to run it afterwards.
 
 **Colab notebook:** [`notebooks/yelp_aspect_agents_colab.ipynb`](notebooks/yelp_aspect_agents_colab.ipynb)
 ([open in Colab](https://colab.research.google.com/github/manastole03/Grader_Project/blob/main/yelp-aspect-agents/notebooks/yelp_aspect_agents_colab.ipynb)) runs the whole pipeline in one notebook with the same model, prompts and formulas.
